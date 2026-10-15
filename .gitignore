@@ -1,0 +1,14 @@
+node_modules/
+.npm-cache/
+.firebase/
+.DS_Store
+.env
+data/
+firmware/**/secrets.h
+
+# Local ESP32 compiler/cache and machine-specific VS Code Arduino CLI wrapper
+.arduino/
+.env.*
+.vscode/arduino-cli.yaml
+.vscode/bin/
+.vscode/settings.json

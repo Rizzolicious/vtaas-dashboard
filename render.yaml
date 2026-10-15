@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: vtaas-comparison-relay
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: node cloud-relay.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: FIREBASE_PROJECT_ID
+        value: vt-aas
+      - key: ALLOWED_ORIGINS
+        value: https://vt-aas.web.app,https://vt-aas.firebaseapp.com,http://localhost:8080,http://127.0.0.1:8080

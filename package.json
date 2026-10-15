@@ -1,0 +1,12 @@
+{
+  "name": "vtaas-iot-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser dashboard and Wi-Fi telemetry relay for an ESP32 vehicle safety project",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

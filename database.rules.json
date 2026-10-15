@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "vehicles": {
+      "vehicle_01": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid === '1ErERJr6zyZtXYBm6hkZVROJOiI2'",
+        "events": {
+          ".indexOn": ["timestamp"]
+        }
+      }
+    }
+  }
+}

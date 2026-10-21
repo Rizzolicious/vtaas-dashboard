@@ -12,3 +12,8 @@ firmware/**/secrets.h
 .vscode/arduino-cli.yaml
 .vscode/bin/
 .vscode/settings.json
+.env.local
+.device-ws-token
+.wrangler/
+.wrangler-user-config/
+.firebase-user-config/

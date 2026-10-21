@@ -11,6 +11,48 @@
 .map-frame .leaflet-tile-pane{filter:grayscale(.45) brightness(.82) contrast(.92)}
 .map-frame .leaflet-control-attribution{font-size:8px;background:#101b20d9;color:#a8b8b6}
 .map-frame .leaflet-control-attribution a{color:#8fcab0}
+
+/* Keep maps and sensor plots inside their panels at every viewport size. */
+.overview-grid,
+.sensor-readings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.map-panel,
+.sensor-panel,
+.reading-panel{min-width:0;overflow:hidden}
+.map-frame{width:auto;min-width:0;isolation:isolate}
+.map-frame #map-canvas,
+.map-frame .leaflet-container{width:100%;height:100%;min-width:0}
+.mini-chart-wrap{min-width:0;max-width:100%;overflow:hidden}
+.mini-chart{display:block;flex:1 1 auto;min-width:0;max-width:100%;overflow:hidden}
+.large-chart{min-width:0;max-width:100%;overflow:hidden}
+.large-chart svg{display:block;min-width:0;max-width:100%;overflow:hidden}
+.axis-readings{grid-template-columns:repeat(3,minmax(0,1fr))}
+.axis-card{min-width:0;overflow:hidden}
+.sensor-foot{min-width:0;gap:8px}
+.sensor-foot>span{min-width:0}
+.sensor-foot>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:900px){
+  .overview-grid,.sensor-readings-grid{grid-template-columns:minmax(0,1fr)}
+}
+@media(max-width:620px){
+  .overview-grid,.sensor-readings-grid{grid-template-columns:minmax(0,1fr)}
+  .map-frame{height:clamp(180px,58vw,230px)}
+  .mini-chart-wrap{height:145px;padding-right:10px}
+  .sensor-tabs{padding-left:9px;padding-right:9px}
+  .sensor-tab{padding-left:7px;padding-right:7px}
+  .sensor-foot{font-size:8px}
+  .sensor-foot b{font-size:8px}
+}
+.protocol-metrics>.field-help{max-width:none;margin:0 16px 12px;padding:0;line-height:1.5}
+.map-frame #map-canvas{position:absolute;inset:0;overflow:hidden}
+.map-frame .leaflet-container{position:relative;overflow:hidden;background:#162128;outline:0}
+.map-frame .leaflet-pane,
+.map-frame .leaflet-tile,
+.map-frame .leaflet-marker-icon,
+.map-frame .leaflet-marker-shadow,
+.map-frame .leaflet-tile-container,
+.map-frame .leaflet-pane>svg,
+.map-frame .leaflet-pane>canvas{position:absolute;left:0;top:0}
+.map-frame .leaflet-tile{max-width:none!important;max-height:none!important}
 .evidence-modal{max-height:calc(100dvh - 32px);overflow:auto}
 .evidence-location{margin-top:14px}
 .evidence-location-map{height:175px;border:1px solid #2a3b40;border-radius:6px;overflow:hidden;background:#162128}
@@ -69,3 +111,14 @@
   #evidence-modal .evidence-chart-heading strong{color:#111!important}
 }
 @media(max-width:900px){.brand>span:last-child{display:none}.primary-nav{gap:8px}.nav-item{width:40px;height:44px;margin:0 auto;padding:0;justify-content:center;gap:0}.nav-icon{width:24px;height:24px;flex-basis:24px}.nav-icon svg{width:20px;height:20px}}
+
+/* Active transport stays selected until an explicit disconnect. */
+.protocol-tab:disabled,.connect-button:disabled,#simulate-event:disabled,.scenario-button:disabled{opacity:.4;cursor:not-allowed}
+.protocol-form input:disabled{opacity:.65;cursor:not-allowed}
+#protocol-lock-note{margin:0 0 12px;color:var(--amber)}
+
+/* Keep controls usable and tile failure feedback visible without covering the map. */
+.map-overlay{left:auto;right:12px;pointer-events:none;z-index:800}
+.map-tile-error{position:absolute;left:8px;right:8px;bottom:24px;z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;background:#18241ff2;border:1px solid #64734e;border-radius:5px;font-size:10px;color:#e4e9d8}
+.map-tile-error[hidden]{display:none}
+.map-tile-error button{background:#335743;color:#e4f4e9;border:1px solid #7a9e88;border-radius:4px;padding:5px 8px;cursor:pointer;white-space:nowrap}

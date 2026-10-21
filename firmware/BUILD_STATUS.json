@@ -1,0 +1,18 @@
+{
+  "project": "VT&AAS real hardware firmware",
+  "target": "ESP32 NodeMCU-32S",
+  "transport": "authenticated TLS WebSocket relay",
+  "hardware": [
+    "MPU6050",
+    "NEO-6M GPS",
+    "SIM800L",
+    "red LED GPIO4",
+    "green LED GPIO18",
+    "buzzer GPIO19"
+  ],
+  "simulation": false,
+  "compiled": true,
+  "physical_upload_verified": false,
+  "build": "Arduino CLI, esp32:esp32:nodemcu-32s, ESP32 core 3.3.12",
+  "build_result": "Sketch uses 1,158,232 bytes (88%); globals use 51,296 bytes (15%)."
+}

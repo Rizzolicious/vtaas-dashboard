@@ -1,0 +1,19 @@
+{
+  "name": "vtaas-ws-relay",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "observability": { "enabled": true },
+  "vars": {
+    "FIREBASE_PROJECT_ID": "vt-aas",
+    "VEHICLE_ID": "vehicle_01",
+    "ALLOWED_ORIGINS": "https://vt-aas.web.app,https://vt-aas.firebaseapp.com,http://localhost:8080,http://127.0.0.1:8080"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY", "class_name": "VtaasRelay" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["VtaasRelay"] }
+  ]
+}

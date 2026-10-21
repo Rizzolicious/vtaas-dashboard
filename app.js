@@ -30,17 +30,18 @@
   const DEMO_ROUTE_LENGTH = DEMO_ROUTE_SEGMENTS.reduce((sum, segment) => sum + segment.length, 0);
 
   const model = {
-    protocol: 'demo', connected: true, messageCount: 0, errorCount: 0, reconnectCount: 0,
+    protocol: 'demo', protocolLock: null, connected: false, connectionState: 'disconnected', transportGeneration: 0, connectionTimer: null, messageCount: 0, errorCount: 0, reconnectCount: 0,
     lastMessageAt: null, lastGpsAt: null, telemetry: null, acceleration: [], gyroscope: [], preEventBuffer: [],
     events: loadEvents(), eventIds: new Set(), currentEventId: null, alertDismissed: false, deviceId: null,
-    cloudMode: false, cloudUnsubscribers: [], firebaseClient: null, demoComparison: null,
+    cloudMode: false, cloudUnsubscribers: [], firebaseClient: null,
     calibration: loadCalibration(), calibrationCapture: null, calibrationTimer: null, calibrationMessage: '',
     demoTime: 0, demoDistance: 0, demoPreviousSpeed: null, demoPreviousHeading: null, demoPreviousRoll: null, demoPreviousPitch: null, demoLastMotionAt: null,
     gpsUnavailableUntil: 0, demoCancelledUntil: 0, demoCountdown: 0,
     demoAccidentActive: false, demoCrashGps: null, demoImpactUntil: 0, demoCountdownEndsAt: 0, demoCountdownInterval: null, demoAccidentSeverity: 'NONE',
     chartMode: 'accel', ws: null, mqtt: null, bleDevice: null, bleServer: null,
-    bleCharacteristic: null, bleBuffer: '', reconnectTimer: null, reconnectAttempt: 0,
-    intentionalDisconnect: false, map: null, mapMarker: null, evidenceMap: null, toastTimer: null, historyQuery: '', historyFilter: 'all'
+    bleCharacteristic: null, bleBuffer: '', bleProbe: null, bleProbeTimer: null, bleProbePending: null, bleProbeId: 0,
+    bleRtts: [], bleLastRttAt: null, bleDelivery: null, networkProbeTimer: null, networkProbeSend: null, networkProbePending: null, networkProbeSession: '', networkProbeId: 0, networkRtts: [], networkLastRttAt: null, reconnectTimer: null, reconnectAttempt: 0,
+    intentionalDisconnect: false, map: null, mapMarker: null, mapTiles: null, mapResizeFrame: null, mapResizeObserver: null, evidenceMap: null, toastTimer: null, historyQuery: '', historyFilter: 'all'
   };
 
   model.events.forEach(event => model.eventIds.add(event.event_id));
@@ -102,13 +103,63 @@
     const titles = { overview: 'Overview', sensors: 'Live sensors', protocols: 'Protocols', history: 'Event history' };
     $('#crumb-title').textContent = titles[page] || 'Overview';
     if (page === 'history') renderHistory();
+    if (page === 'overview') invalidateMapSize();
+  }
+
+  function mapIsVisible() {
+    const canvas = $('#map-canvas');
+    return $('#page-overview').classList.contains('active') && canvas.clientWidth > 0 && canvas.clientHeight > 0;
+  }
+
+  function invalidateMapSize() {
+    if (model.mapResizeFrame !== null) return;
+    model.mapResizeFrame = requestAnimationFrame(() => {
+      model.mapResizeFrame = null;
+      if (!mapIsVisible()) return;
+      if (model.map) model.map.invalidateSize({ pan: false, debounceMoveend: true });
+      if (model.telemetry?.gps) updateMap(model.telemetry.gps);
+    });
+  }
+
+  function updateProtocolLock() {
+    const locked = model.protocolLock !== null;
+    $$('.protocol-tab').forEach(tab => {
+      tab.disabled = locked && tab.dataset.protocol !== model.protocolLock;
+      tab.title = tab.disabled ? 'Disconnect the current protocol to switch.' : '';
+    });
+    $$('.connect-button, .protocol-form input').forEach(control => { control.disabled = locked; });
+    $('#simulate-event').disabled = locked && model.protocolLock !== 'demo';
+    $$('[data-scenario]').forEach(button => { button.disabled = locked && model.protocolLock !== 'demo'; });
+    const note = $('#protocol-lock-note');
+    note.hidden = !locked;
+    note.textContent = locked ? 'Disconnect the current protocol before switching. You can still view your dashboard.' : '';
+  }
+
+  function canStartProtocol() {
+    if (model.protocolLock === null) return true;
+    showToast('Disconnect the current protocol before starting another connection or demo.');
+    return false;
+  }
+
+  function lockProtocol(protocol) {
+    model.protocolLock = protocol;
+    updateProtocolLock();
   }
 
   function setProtocolTab(protocol) {
+    if (model.protocolLock !== null && protocol !== model.protocolLock) {
+      showToast('Disconnect the current protocol before switching.');
+      return;
+    }
     $$('.protocol-tab').forEach(tab => tab.classList.toggle('selected', tab.dataset.protocol === protocol));
-    ['demo', 'websocket', 'mqtt', 'bluetooth'].forEach(name => $(`#form-${name}`).classList.toggle('hidden', name !== protocol));
+    ['demo', 'websocket', 'mqtt', 'bluetooth', 'firebase'].forEach(name => $(`#form-${name}`).classList.toggle('hidden', name !== protocol));
     model.protocolSelection = protocol;
-    const titles = { demo: ['Demo stream', 'Explore the dashboard using simulated vehicle messages.', 'DEMO'], websocket: ['WebSocket', 'Connect directly to a WebSocket server on your ESP32 or gateway.', 'WS'], mqtt: ['MQTT', 'Subscribe to an MQTT broker through its WebSocket listener.', 'MQTT'], bluetooth: ['Bluetooth LE', 'Receive telemetry from an ESP32 BLE GATT characteristic.', 'BLE'] };
+    if (model.protocolLock === null && model.connectionState === 'disconnected' && model.protocol !== protocol) {
+      model.protocol = protocol; model.deviceId = null;
+      clearTelemetryForLiveWait();
+      toggleProtocolConnectionState('disconnected', `${protocolName(protocol)} selected. Connect to start receiving data.`);
+    }
+    const titles = { firebase: ['Firebase cloud', 'Choose a protocol above to connect your ESP32, or start the demo.', 'CLOUD'], demo: ['Demo stream', 'Explore the dashboard using simulated vehicle messages.', 'DEMO'], websocket: ['WebSocket', 'Connect directly to a WebSocket server on your ESP32 or gateway.', 'WS'], mqtt: ['MQTT', 'Subscribe to an MQTT broker through its WebSocket listener.', 'MQTT'], bluetooth: ['Bluetooth LE', 'Receive telemetry from an ESP32 BLE GATT characteristic.', 'BLE'] };
     const [title, description, badge] = titles[protocol];
     $('#protocol-title').textContent = title;
     $('#protocol-description').textContent = description;
@@ -118,34 +169,78 @@
     }
   }
 
-  function toggleProtocolConnectionState(connected, copy) {
+  function failConnection(message) {
+    model.intentionalDisconnect = true;
+    cleanupTransport({ preserveMeasurements: true });
+    toggleProtocolConnectionState('disconnected', message);
+    showToast(message);
+  }
+
+  function startConnectionDeadline(message) {
+    clearTimeout(model.connectionTimer);
+    const generation = model.transportGeneration;
+    model.connectionTimer = setTimeout(() => {
+      if (generation !== model.transportGeneration || model.connectionState !== 'connecting') return;
+      model.errorCount += 1; updateConnectionCounters();
+      failConnection(message);
+    }, 20000);
+  }
+
+  function protocolName(protocol = model.protocol) {
+    return ({ demo: 'Demo', websocket: 'WebSocket', mqtt: 'MQTT', bluetooth: 'Bluetooth LE', firebase: 'Firebase cloud' })[protocol] || 'Device';
+  }
+
+  function toggleProtocolConnectionState(state, copy) {
+    state = typeof state === 'boolean' ? (state ? 'connected' : 'disconnected') : state;
+    model.connectionState = state;
+    const connected = state === 'connected';
+    if (state !== 'connecting') { clearTimeout(model.connectionTimer); model.connectionTimer = null; }
+    const busy = state === 'connecting' || state === 'disconnecting';
     model.connected = connected;
-    $('#connection-dot').classList.toggle('offline', !connected);
-    $('#protocol-connection-dot').classList.toggle('offline', !connected);
-    $('#connection-state').textContent = connected ? (model.protocol === 'demo' ? 'LIVE' : 'CONNECTED') : 'OFFLINE';
-    $('#connection-state').className = `connection-state ${connected ? '' : 'status-red'}`;
-    $('#big-connection-state').textContent = connected ? (model.protocol === 'demo' ? 'DEMO ACTIVE' : 'CONNECTED') : 'DISCONNECTED';
-    $('#big-connection-state').style.color = connected ? 'var(--green)' : 'var(--red)';
+    const label = state.toUpperCase(), color = connected ? 'var(--green)' : busy ? 'var(--amber)' : 'var(--red)';
+    for (const id of ['connection-dot', 'protocol-connection-dot', 'unit-dot']) {
+      $(`#${id}`).classList.toggle('offline', !connected && !busy);
+      $(`#${id}`).classList.toggle('warning', busy);
+    }
+    $('#connection-state').textContent = label;
+    $('#connection-state').className = `connection-state ${busy ? 'status-amber' : connected ? '' : 'status-red'}`;
+    $('#big-connection-state').textContent = label;
+    $('#big-connection-state').style.color = color;
     $('#protocol-status-copy').textContent = copy;
     $('#connection-status').textContent = copy;
-    $('#sensor-page-live').textContent = connected ? 'Listening' : 'Offline';
+    $('#selected-protocol-value').textContent = protocolName();
+    $('#disconnect-button').disabled = state === 'disconnecting' || (state === 'disconnected' && model.protocolLock === null && model.protocol !== 'demo');
+    $('#disconnect-button').textContent = state === 'disconnecting' ? 'Disconnecting…' : model.protocol === 'demo' ? (connected ? 'Stop demo' : 'Start demo') : 'Disconnect';
+    $('#sensor-page-live').textContent = `${protocolName()} · ${state}`;
     $('#sensor-description').textContent = model.protocol === 'demo' ? 'Demo mode uses simulated sensor and GPS values.' : 'Motion and GPS readings received from the ESP32.';
     $('#health-description').textContent = model.protocol === 'demo' ? 'Simulated values are shown for the dashboard demo.' : 'Hardware values appear only when reported by the ESP32.';
-    $('#live-mode').textContent = connected ? (model.protocol === 'demo' ? 'DEMO DATA' : 'LIVE CONNECTION') : 'OFFLINE';
-    $('#live-dot').style.background = connected ? 'var(--green)' : 'var(--red)';
-    $('#live-dot').style.boxShadow = connected ? '0 0 0 3px #16392e' : '0 0 0 3px #402424';
-    $('#connection-name').textContent = ({ demo: 'Demo stream', websocket: 'WebSocket', mqtt: 'MQTT broker', bluetooth: 'Bluetooth LE', firebase: 'Firebase cloud' })[model.protocol];
+    $('#live-mode').textContent = `${protocolName().toUpperCase()} · ${label}`;
+    $('#live-dot').style.background = color;
+    $('#live-dot').style.boxShadow = `0 0 0 3px ${connected ? '#16392e' : busy ? '#41351f' : '#402424'}`;
+    $('#connection-name').textContent = protocolName();
     $('#protocol-mark').textContent = ({ demo: 'D', websocket: 'W', mqtt: 'M', bluetooth: 'B', firebase: 'F' })[model.protocol];
-    $('#protocol-mark').style.color = connected ? 'var(--green)' : 'var(--red)';
-    syncCloudAction();
-    updateUnitCard();
-    renderCalibrationPanel();
+    $('#protocol-mark').style.color = color;
+    $('.unit-link i').style.background = color;
+    if (!connected && model.telemetry) $('#sensor-freshness').textContent = `Last reading · ${state}`;
+    if (model.telemetry?.gps?.valid) $('#map-location-label').textContent = model.protocol === 'demo' ? 'DEMO LOCATION' : model.telemetry?.simulation === true ? (connected ? 'SIMULATED LOCATION' : 'LAST SIMULATED LOCATION') : connected ? 'LIVE LOCATION' : 'LAST LOCATION';
+    syncCloudAction(); updateUnitCard(); renderCalibrationPanel();
+  }
+
+  function beginProtocolSession() {
+    model.deviceId = null;
+    model.messageCount = 0; model.errorCount = 0; model.reconnectCount = 0; model.reconnectAttempt = 0;
+    clearTelemetryForLiveWait();
+    $('#protocol-last-message').textContent = '—';
+    updateConnectionCounters();
   }
 
   function syncCloudAction() {
     const button = $('#protocol-shortcut');
     if (!button) return;
-    if (model.protocol === 'demo' && model.firebaseClient) {
+    if (model.protocolLock !== null) {
+      button.innerHTML = '<span class="button-pulse"></span>Manage connection';
+      button.setAttribute('aria-label', 'Manage the current connection');
+    } else if (model.protocol === 'demo' && model.firebaseClient) {
       button.innerHTML = '<span class="button-pulse"></span>Return to live cloud';
       button.setAttribute('aria-label', 'Return to live Firebase data');
     } else {
@@ -155,18 +250,24 @@
   }
 
   function updateUnitCard() {
-    const demo = model.protocol === 'demo';
-    const id = model.telemetry?.device_id || model.deviceId;
-    const named = model.telemetry?.vehicle_name || model.telemetry?.device_name;
-    const defaultName = id && id !== 'vehicle_01' ? `Vehicle ${id}` : 'Vehicle 01';
-    $('#unit-mode').textContent = model.connected ? (demo ? 'DEMO VEHICLE' : 'LIVE DEVICE') : 'DEVICE OFFLINE';
+    const demo = model.protocol === 'demo', state = model.connectionState;
+    const id = demo ? 'DEMO-01' : model.telemetry?.device_id || model.deviceId;
+    const named = demo ? 'Demo vehicle' : model.telemetry?.vehicle_name || model.telemetry?.device_name;
+    const defaultName = id ? (id === 'vehicle_01' ? 'Vehicle 01' : `Vehicle ${id}`) : 'Waiting for device';
+    $('#unit-mode').textContent = demo ? 'DEMO VEHICLE' : `${protocolName().toUpperCase()} DEVICE`;
     $('#unit-name').textContent = named || defaultName;
-    $('#unit-id').textContent = demo ? 'ESP32 · DEMO-01' : `ESP32 · ${id || 'waiting for device ID'}`;
+    $('#unit-id').textContent = `ESP32 · ${id || 'waiting for device ID'}`;
     const dataAge = model.lastMessageAt ? Date.now() - model.lastMessageAt : Infinity;
-    $('#unit-status').textContent = model.connected
-      ? (demo ? 'Connected in demo mode' : !model.lastMessageAt ? 'Connected · waiting for data' : dataAge > 15000 ? 'Connected · data is stale' : `Live · ${model.protocol.toUpperCase()}`)
-      : 'Not connected';
-    $('#unit-dot').classList.toggle('offline', !model.connected);
+    const detail = state !== 'connected' ? state[0].toUpperCase() + state.slice(1)
+      : demo ? 'Connected · simulated data'
+      : !model.lastMessageAt ? 'Connected · waiting for device data'
+      : dataAge > 15000 ? 'Connected · data is stale' : 'Connected · receiving data';
+    $('#unit-status').textContent = `${protocolName()} · ${detail}`;
+    const color = state === 'connected' ? 'var(--green)' : state === 'disconnected' ? 'var(--red)' : 'var(--amber)';
+    $('#unit-dot').style.background = color;
+    $('#unit-dot').style.boxShadow = `0 0 0 3px ${state === 'connected' ? '#16392e' : state === 'disconnected' ? '#402424' : '#41351f'}`;
+    $('#unit-dot').classList.toggle('offline', state === 'disconnected');
+    $('#unit-dot').classList.toggle('warning', state === 'connecting' || state === 'disconnecting');
   }
 
   function clearTelemetryForLiveWait() {
@@ -179,7 +280,8 @@
     model.currentEventId = null;
     if (model.map) model.map.remove();
     model.map = null;
-    model.mapMarker = null;
+    model.mapMarker = null; model.mapTiles = null;
+    $('#map-tile-error').hidden = true;
     $('#vehicle-state').textContent = 'Waiting';
     $('#vehicle-chip').textContent = '● WAITING';
     $('#vehicle-status-note').textContent = 'Waiting for ESP32 telemetry';
@@ -197,7 +299,7 @@
     $('#open-map').disabled = true;
     ['axis-x', 'axis-y', 'axis-z'].forEach(id => { $(`#${id}`).textContent = '—'; });
     ['chart-line-a', 'chart-line-b', 'chart-line-c'].forEach(id => { $(`#${id}`).setAttribute('d', ''); });
-    ['accel-chart', 'gyro-chart'].forEach(id => $(`#${id} .chart-line`).forEach(line => line.setAttribute('d', '')));
+    ['accel-chart', 'gyro-chart'].forEach(id => $$(`#${id} .chart-line`).forEach(line => line.setAttribute('d', '')));
     $('#accel-readings').innerHTML = '';
     $('#gyro-readings').innerHTML = '';
     $('#last-message').textContent = 'Waiting for telemetry';
@@ -245,7 +347,6 @@
       else if (ArrayBuffer.isView(raw)) parsed = JSON.parse(new TextDecoder().decode(raw).trim());
       else parsed = raw;
       const payload = cleanPayload(parsed);
-      if (protocol === 'demo') publishDemoComparison(payload);
       handleMessage(payload, protocol, topic);
       return true;
     } catch (error) {
@@ -304,7 +405,9 @@
     if (model.preEventBuffer.length > 60) model.preEventBuffer.shift();
     updateConnectionCounters();
     renderDashboard(topic);
-    if (payload.benchmark && typeof payload.benchmark === 'object') updateBenchmark(payload.benchmark);
+    if (['bluetooth', 'websocket', 'mqtt'].includes(protocol)) updateBleDelivery(payload);
+    else if (payload.benchmark && typeof payload.benchmark === 'object') updateBenchmark(payload.benchmark);
+    $('#protocol-last-message').textContent = localTime();
   }
 
   function pushPoint(series, values) {
@@ -399,12 +502,160 @@
     }
   }
 
+  function resetMeasurements() {
+    model.bleDelivery = new window.VtaasDeliveryWindow();
+    model.bleRtts = []; model.bleLastRttAt = null;
+    $('#bench-latency').textContent = '—'; $('#bench-delivery').textContent = '—';
+    $('#bench-latency-label').textContent = 'LATENCY';
+    $('#bench-latency-note').textContent = 'Requires a measured device benchmark';
+    $('#bench-delivery-note').textContent = 'Requires sent and received message counters';
+  }
+
   function updateBenchmark(benchmark) {
     const latency = finite(benchmark.latency_ms);
     const received = finite(benchmark.received_messages);
     const sent = finite(benchmark.sent_messages);
-    if (latency !== null && latency >= 0) $('#bench-latency').textContent = `${Math.round(latency)} ms`;
-    if (received !== null && sent !== null && sent > 0 && received >= 0) $('#bench-delivery').textContent = `${Math.min(100, received / sent * 100).toFixed(1)}%`;
+    if (latency !== null && latency >= 0) {
+      $('#bench-latency').textContent = `${Math.round(latency)} ms`;
+      $('#bench-latency-note').textContent = 'Reported by device benchmark';
+    }
+    if (received !== null && sent !== null && sent > 0 && received >= 0 && received <= sent) {
+      $('#bench-delivery').textContent = `${(received / sent * 100).toFixed(1)}%`;
+      $('#bench-delivery-note').textContent = `${received} received / ${sent} sent · device benchmark`;
+    }
+  }
+
+  function updateBleDelivery(payload) {
+    const result = model.bleDelivery.observe(payload);
+    if (!result) return;
+    $('#bench-delivery').textContent = `${(100 * result.received / result.expected).toFixed(1)}%`;
+    $('#bench-delivery-note').textContent = `${result.received} unique / ${result.expected} expected between first and latest frames · ${result.missing} missing`;
+  }
+
+  function stopBleProbes() {
+    clearInterval(model.bleProbeTimer); model.bleProbeTimer = null;
+    model.bleProbe = null; model.bleProbePending = null;
+  }
+
+  async function sendBleProbe() {
+    const probe = model.bleProbe;
+    if (!probe || !model.bleServer?.connected) return;
+    const now = performance.now();
+    if (model.bleLastRttAt !== null && now - model.bleLastRttAt > 12000) {
+      model.bleRtts = []; model.bleLastRttAt = null;
+      $('#bench-latency').textContent = '—';
+      $('#bench-latency-note').textContent = 'No recent ping reply';
+    }
+    if (model.bleProbePending && now - model.bleProbePending.started < 4000) return;
+    if (model.bleProbePending) $('#bench-latency-note').textContent = 'Previous ping timed out · retrying';
+    const id = ++model.bleProbeId >>> 0;
+    const packet = new Uint8Array([80, 73, 78, 71, 0, 0, 0, 0]);
+    new DataView(packet.buffer).setUint32(4, id, true);
+    model.bleProbePending = { id, started: now };
+    try { await probe.writeValueWithResponse(packet); }
+    catch {
+      if (model.bleProbe !== probe) return;
+      stopBleProbes();
+      $('#bench-latency').textContent = '—';
+      $('#bench-latency-note').textContent = 'Ping write failed · reconnect to retry';
+    }
+  }
+
+  function acceptBlePong(payload) {
+    if (payload?.message_type !== 'benchmark_pong') return false;
+    const pending = model.bleProbePending;
+    if (!pending || payload.probe_id !== pending.id) return true;
+    model.bleProbePending = null;
+    const now = performance.now(), elapsed = now - pending.started;
+    if (elapsed < 0 || elapsed >= 4000) return true;
+    model.bleRtts.push(elapsed);
+    if (model.bleRtts.length > 20) model.bleRtts.shift();
+    model.bleLastRttAt = now;
+    const average = model.bleRtts.reduce((sum, value) => sum + value, 0) / model.bleRtts.length;
+    $('#bench-latency').textContent = `${Math.round(average)} ms`;
+    $('#bench-latency-note').textContent = `Mean of ${model.bleRtts.length} recent ping replies · includes device handling · not one-way delay`;
+    return true;
+  }
+
+  function stopNetworkProbes() {
+    clearInterval(model.networkProbeTimer); model.networkProbeTimer = null;
+    model.networkProbeSend = null; model.networkProbePending = null;
+    model.mqttProbeReplyTopic = null;
+  }
+
+  function startNetworkProbes(send, replyTopic = null) {
+    stopNetworkProbes();
+    model.mqttProbeReplyTopic = replyTopic;
+    model.networkProbeSend = send;
+    model.networkProbeSession = crypto.randomUUID(); model.networkProbeId = 0;
+    model.networkRtts = []; model.networkLastRttAt = null;
+    $('#bench-latency-label').textContent = 'LATENCY (ROUND TRIP)';
+    $('#bench-latency').textContent = '—';
+    $('#bench-latency-note').textContent = 'Waiting for ESP32 ping reply · sampled every 5 seconds';
+    sendNetworkProbe();
+    model.networkProbeTimer = setInterval(sendNetworkProbe, 5000);
+  }
+
+  function sendNetworkProbe() {
+    if (!model.connected || !model.networkProbeSend) return;
+    const now = performance.now();
+    if (model.networkLastRttAt !== null && now - model.networkLastRttAt > 12000) {
+      model.networkRtts = []; model.networkLastRttAt = null;
+      $('#bench-latency').textContent = '—';
+    }
+    if (model.networkProbePending && now - model.networkProbePending.started < 4000) return;
+    if (model.networkProbePending) $('#bench-latency-note').textContent = 'No ESP32 reply · check updated firmware and diagnostic topic permissions';
+    const id = `${model.networkProbeSession}-${++model.networkProbeId}`;
+    model.networkProbePending = { id, started: now };
+    try {
+      const result = model.networkProbeSend({ message_type: 'benchmark_ping', probe_id: id });
+      // Some transports report send errors asynchronously.
+      if (result?.catch) result.catch(() => {
+        if (model.networkProbePending?.id === id) { model.networkProbePending = null; $('#bench-latency-note').textContent = 'Ping could not be sent · waiting for connection'; }
+      });
+    } catch {
+      model.networkProbePending = null;
+      $('#bench-latency-note').textContent = 'Ping could not be sent · waiting for connection';
+    }
+  }
+
+  function acceptNetworkPong(payload) {
+    if (payload?.message_type !== 'benchmark_pong') return false;
+    const pending = model.networkProbePending;
+    if (!pending || payload.probe_id !== pending.id) return true;
+    model.networkProbePending = null;
+    const now = performance.now(), elapsed = now - pending.started;
+    if (elapsed < 0 || elapsed >= 4000) return true;
+    model.networkRtts.push(elapsed);
+    if (model.networkRtts.length > 20) model.networkRtts.shift();
+    model.networkLastRttAt = now;
+    const average = model.networkRtts.reduce((sum, value) => sum + value, 0) / model.networkRtts.length;
+    $('#bench-latency').textContent = `${Math.round(average)} ms`;
+    $('#bench-latency-note').textContent = `Mean of ${model.networkRtts.length} ESP32 round trips · includes ${model.protocol === 'mqtt' ? 'broker' : 'cloud relay'} and device handling · not one-way delay`;
+    return true;
+  }
+
+  function startMqttProbes(client, telemetryTopic) {
+    stopNetworkProbes();
+    $('#bench-latency-label').textContent = 'LATENCY (ROUND TRIP)';
+    // A single device prefix is needed; a terminal /# also includes its events.
+    const suffix = telemetryTopic.endsWith('/telemetry') ? '/telemetry' : telemetryTopic.endsWith('/#') ? '/#' : null;
+    const prefix = suffix ? telemetryTopic.slice(0, -suffix.length) : '';
+    if (!prefix || /[+#]/.test(prefix)) {
+      $('#bench-latency-note').textContent = 'For device ping, use a device topic ending in /telemetry or /#'; return;
+    }
+    const replyTopic = `${prefix}/benchmark/pong`;
+    const generation = model.transportGeneration;
+    client.subscribe(replyTopic, { qos: 0 }, (error, granted) => {
+      if (model.mqtt !== client || generation !== model.transportGeneration || model.intentionalDisconnect) return;
+      if (error || granted?.some(item => item.qos === 128)) {
+        $('#bench-latency-note').textContent = 'Telemetry connected; allow subscription to the benchmark/pong topic for latency'; return;
+      }
+      startNetworkProbes(packet => new Promise((resolve, reject) => {
+        if (model.mqtt !== client || !client.connected) { reject(new Error('Disconnected')); return; }
+        client.publish(`${prefix}/benchmark/ping`, JSON.stringify(packet), { qos: 0, retain: false }, error => error ? reject(error) : resolve());
+      }), replyTopic);
+    });
   }
 
   function typeFrom(payload, telemetry) {
@@ -457,7 +708,7 @@
       : 0;
     const reportedDeceleration = finite(payload.deceleration_mps2);
     const decelerationMps2 = existing?.deceleration_mps2 ?? reportedDeceleration ?? Math.max(horizontalAcceleration, speedDropDeceleration);
-    const decelerationSource = existing?.deceleration_source || (reportedDeceleration !== null ? 'Device reported' : speedDropDeceleration > horizontalAcceleration ? 'Speed change estimate' : 'Accelerometer estimate');
+    const decelerationSource = existing?.deceleration_source || (reportedDeceleration !== null ? (model.protocol === 'demo' ? 'Simulation: speed / 0.6 s stop' : payload.simulation === true ? (payload.deceleration_source || 'Simulator reported') : 'Device reported') : speedDropDeceleration > horizontalAcceleration ? 'Speed change estimate' : 'Accelerometer estimate');
     const estimatedSeverity = existing?.estimated_severity || estimateAccidentSeverity(crashSnapshot.speed_kmh || 0, decelerationMps2);
     let sensorHistory = existing?.sensor_history || [...preEvent.slice(-10), crashSnapshot];
     const eventStartedAt = new Date(existing?.timestamp || payload.timestamp || telemetry.timestamp).getTime();
@@ -547,15 +798,13 @@
     $('#sensor-updated').textContent = date;
     $('#sensor-footer-time').textContent = `Last update ${date}`;
     const age = Date.now() - model.lastMessageAt;
-    $('#sensor-freshness').textContent = age < 4000 ? 'Fresh' : age < 15000 ? 'Data aging' : 'Stale data';
-    $('#sensor-freshness').style.color = age < 4000 ? 'var(--green)' : age < 15000 ? 'var(--amber)' : 'var(--red)';
+    $('#sensor-freshness').textContent = !model.connected ? `Last reading · ${model.connectionState}` : age < 4000 ? 'Fresh' : age < 15000 ? 'Data aging' : 'Stale data';
+    $('#sensor-freshness').style.color = !model.connected ? (model.connectionState === 'disconnected' ? 'var(--red)' : 'var(--amber)') : age < 4000 ? 'var(--green)' : age < 15000 ? 'var(--amber)' : 'var(--red)';
     const unitAccel = data.acceleration?.unit || 'm/s²';
     const unitGyro = data.gyroscope?.unit || '°/s';
     $('#chart-units').textContent = model.chartMode === 'accel' ? unitAccel : unitGyro;
     $('#accel-unit').textContent = unitAccel;
     $('#gyro-unit').textContent = unitGyro;
-    $('#map-overlay').classList.toggle('visible', gps.valid);
-    $('#open-map').disabled = !gps.valid;
     renderCalibrationPanel();
   }
 
@@ -584,7 +833,7 @@
   }
 
   function demoRoadPosition(distance) {
-    let remaining = distance % DEMO_ROUTE_LENGTH;
+    let remaining = ((distance % DEMO_ROUTE_LENGTH) + DEMO_ROUTE_LENGTH) % DEMO_ROUTE_LENGTH;
     for (const segment of DEMO_ROUTE_SEGMENTS) {
       if (remaining <= segment.length) {
         const fraction = segment.length ? remaining / segment.length : 0;
@@ -598,9 +847,9 @@
     return DEMO_ROAD_ROUTE[0];
   }
 
-  function demoRoadHeading(distance, lookAheadMeters = 4) {
-    const [lon1, lat1] = demoRoadPosition(distance);
-    const [lon2, lat2] = demoRoadPosition(distance + lookAheadMeters);
+  function demoRoadHeading(distance, lookAheadMeters = 12) {
+    const [lon1, lat1] = demoRoadPosition(distance - lookAheadMeters / 2);
+    const [lon2, lat2] = demoRoadPosition(distance + lookAheadMeters / 2);
     const lat1Rad = lat1 * Math.PI / 180;
     const lat2Rad = lat2 * Math.PI / 180;
     const deltaLon = (lon2 - lon1) * Math.PI / 180;
@@ -614,35 +863,61 @@
   }
 
   function updateMap(gps) {
-    const placeholder = $('#map-placeholder');
-    const overlay = $('#map-overlay');
-    if (!gps.valid) {
-      placeholder.classList.remove('hidden');
-      overlay.classList.remove('visible');
-      $('#open-map').disabled = true;
+    const placeholder = $('#map-placeholder'), overlay = $('#map-overlay');
+    const lat = finite(gps.latitude), lon = finite(gps.longitude);
+    const valid = gps.valid && lat !== null && lon !== null && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+    if (!valid) {
+      placeholder.classList.remove('hidden'); overlay.classList.remove('visible');
+      $('#map-tile-error').hidden = true;
+      $('#open-map').disabled = true; $('#open-map').onclick = null;
       return;
     }
-    placeholder.classList.add('hidden');
-    overlay.classList.add('visible');
-    const lat = gps.latitude, lon = gps.longitude;
-    const position = [lat, lon];
-    if (!model.map && window.L) {
-      model.map = L.map('map-canvas', { zoomControl: true, attributionControl: true }).setView(position, 16);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-      }).addTo(model.map);
-      model.mapMarker = L.circleMarker(position, {
-        radius: 8, color: '#eafff4', weight: 3, fillColor: '#35d995', fillOpacity: 1
-      }).addTo(model.map).bindTooltip('Vehicle 01', { direction: 'top', offset: [0, -8] });
-    } else if (model.map && model.mapMarker) {
-      model.mapMarker.setLatLng(position);
-      if (!model.map.getBounds().pad(-0.15).contains(position)) {
-        model.map.panTo(position, { animate: true, duration: 0.7 });
-      }
-    }
+    $('#map-location-label').textContent = model.protocol === 'demo' ? 'DEMO LOCATION' : model.telemetry?.simulation === true ? (model.connected ? 'SIMULATED LOCATION' : 'LAST SIMULATED LOCATION') : model.connected ? 'LIVE LOCATION' : 'LAST LOCATION';
     $('#open-map').disabled = false;
     $('#open-map').onclick = () => window.open(`https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}`, '_blank', 'noopener');
+    // Never create or pan a Leaflet map inside display:none or a zero-size panel.
+    // Returning to Overview / ResizeObserver will apply the latest GPS fix.
+    if (!mapIsVisible()) return;
+    if (!window.L) {
+      placeholder.classList.add('hidden'); overlay.classList.remove('visible');
+      $('#map-tile-error').hidden = false;
+      return;
+    }
+    placeholder.classList.add('hidden'); overlay.classList.add('visible');
+    const position = [lat, lon];
+    if (!model.map) {
+      const map = L.map('map-canvas', {
+        zoomControl: true, attributionControl: true, scrollWheelZoom: false,
+        zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false
+      }).setView(position, 16);
+      model.map = map;
+      const tiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, updateWhenIdle: true, keepBuffer: 2,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      });
+      model.mapTiles = tiles;
+      tiles.on('tileerror', () => { if (model.map === map) $('#map-tile-error').hidden = false; });
+      tiles.on('load', () => {
+        if (model.map !== map) return;
+        const images = [...tiles.getContainer().querySelectorAll('img.leaflet-tile')];
+        if (images.length && images.every(image => image.complete && image.naturalWidth > 0)) $('#map-tile-error').hidden = true;
+      });
+      tiles.addTo(map);
+      model.mapMarker = L.circleMarker(position, {
+        radius: 8, color: '#eafff4', weight: 3, fillColor: '#35d995', fillOpacity: 1
+      }).addTo(map).bindTooltip(model.protocol === 'demo' ? 'Demo vehicle' : model.telemetry?.device_name || 'Vehicle', { direction: 'top', offset: [0, -8] });
+      invalidateMapSize();
+    } else if (model.mapMarker) {
+      model.mapMarker.setLatLng(position);
+      if (!model.map.getBounds().pad(-0.25).contains(position)) model.map.setView(position, model.map.getZoom(), { animate: false });
+    }
+  }
+
+  function retryMapTiles() {
+    if (!mapIsVisible() || !model.telemetry?.gps?.valid) return;
+    $('#map-tile-error').hidden = true;
+    if (model.mapTiles) { model.map.invalidateSize({ pan: false }); model.mapTiles.redraw(); }
+    else { updateMap(model.telemetry.gps); }
   }
 
   function updateSensorReadings(data) {
@@ -895,7 +1170,6 @@
   }
 
   function stopDemo() {
-    stopDemoComparison();
     clearInterval(model.demoInterval);
     model.demoInterval = null;
     clearInterval(model.demoCountdownInterval);
@@ -904,216 +1178,64 @@
     model.demoCrashGps = null;
     model.demoCountdown = 0;
     model.demoAccidentSeverity = 'NONE';
+    model.demoOverspeedUntil = 0;
   }
 
-  async function startDemoComparison() {
-    if (model.protocol !== 'demo' || !model.demoInterval) startDemo();
-    stopDemoComparison();
-    const websocketUrl = $('#comparison-ws-url').value.trim();
-    const mqttUrl = $('#mqtt-url').value.trim();
-    const mqttTopic = $('#mqtt-publish-topic').value.trim();
-    const mqttUsername = $('#mqtt-user').value.trim();
-    const mqttPassword = $('#mqtt-password').value;
-    if (!/^wss?:\/\//i.test(websocketUrl) || !/^wss?:\/\//i.test(mqttUrl) || !mqttTopic || /[+#]/.test(mqttTopic)) {
-      $('#comparison-note').textContent = 'Enter a WebSocket URL, MQTT broker WebSocket URL, and a publish topic without MQTT wildcards.';
-      return;
-    }
-    if (location.protocol === 'https:' && !websocketUrl.startsWith('wss://')) {
-      $('#comparison-note').textContent = 'This hosted dashboard requires a secure wss:// WebSocket relay. On the local dashboard, ws://localhost is allowed.';
-      return;
-    }
-    if (!mqttUsername || !mqttPassword) {
-      $('#comparison-note').textContent = 'Enter your EMQX username and password before starting the comparison.';
-      return;
-    }
-    if (!window.mqtt || typeof window.mqtt.connect !== 'function') {
-      $('#comparison-note').textContent = 'MQTT.js did not load. Reload the dashboard with internet access and try again.';
-      return;
-    }
-    let relayOrigin, brokerOrigin;
-    try { relayOrigin = new URL(websocketUrl).origin; brokerOrigin = new URL(mqttUrl).origin; }
-    catch { $('#comparison-note').textContent = 'Check both server addresses and try again.'; return; }
-    if (!window.confirm(`Starting this comparison sends simulated demo packets to ${brokerOrigin} and ${relayOrigin}. It also sends your current VT&AAS Firebase sign-in token to ${relayOrigin} so the WebSocket relay can verify your account. Your MQTT login is sent to the broker for sign-in. Continue?`)) return;
-    if (!model.firebaseClient?.getIdToken) {
-      $('#comparison-note').textContent = 'Sign in with your VT&AAS account before starting the cloud comparison.';
-      return;
-    }
-    let firebaseIdToken;
-    try { firebaseIdToken = await model.firebaseClient.getIdToken(); }
-    catch { firebaseIdToken = null; }
-    if (!firebaseIdToken) {
-      $('#comparison-note').textContent = 'Your VT&AAS sign-in could not be verified. Sign in again and retry.';
-      return;
-    }
-    const runId = `demo-${Date.now().toString(36)}`;
-    const newChannel = () => ({ status: 'Connecting', sent: 0, received: 0, errors: 0, latencies: [], pending: new Map(), clients: [] });
-    const run = { active: true, runId, sequence: 0, topic: mqttTopic, firebaseIdToken, websocket: newChannel(), mqtt: newChannel() };
-    model.demoComparison = run;
-    $('#start-demo-comparison').disabled = true;
-    $('#stop-demo-comparison').disabled = false;
-    $('#comparison-note').textContent = 'Connecting both paths. Simulated demo packets will be sent to each endpoint.';
-    renderDemoComparison();
-
-    try {
-      const wsReceiver = new WebSocket(websocketUrl);
-      const wsPublisher = new WebSocket(websocketUrl);
-      run.websocket.clients.push(wsReceiver, wsPublisher);
-      let authenticatedSockets = 0;
-      const setWsState = () => {
-        if (model.demoComparison !== run || !run.active) return;
-        run.websocket.status = authenticatedSockets === 2 ? 'Connected' : 'Connecting';
-        renderDemoComparison();
-      };
-      [wsReceiver, wsPublisher].forEach(client => {
-        client.onopen = () => {
-          if (model.demoComparison !== run || !run.active) return;
-          client.send(JSON.stringify({ type: 'auth', token: firebaseIdToken, run_id: runId }));
-        };
-        client.onmessage = event => {
-          let message;
-          try { message = JSON.parse(event.data); } catch { return; }
-          if (message?.type === 'auth_ok') {
-            authenticatedSockets += 1;
-            setWsState();
-            return;
-          }
-          if (message?.type === 'error') { failDemoComparison(run, 'websocket', message.error || 'Relay rejected the connection'); return; }
-          if (client === wsReceiver) receiveDemoComparison(run, 'websocket', event.data);
-        };
-      });
-      [wsReceiver, wsPublisher].forEach(client => client.onerror = () => failDemoComparison(run, 'websocket', 'Connection error'));
-      [wsReceiver, wsPublisher].forEach(client => client.onclose = () => {
-        if (run.active && model.demoComparison === run) { run.websocket.status = 'Disconnected'; renderDemoComparison(); }
-      });
-    } catch (error) { failDemoComparison(run, 'websocket', error.message); }
-
-    try {
-      const options = { clientId: `vtaas_demo_sub_${Math.random().toString(16).slice(2, 10)}`, clean: true, connectTimeout: 10000, reconnectPeriod: 0 };
-      options.username = mqttUsername;
-      options.password = mqttPassword;
-      const subscriber = window.mqtt.connect(mqttUrl, options);
-      const publisher = window.mqtt.connect(mqttUrl, { ...options, clientId: `vtaas_demo_pub_${Math.random().toString(16).slice(2, 10)}` });
-      run.mqtt.clients.push(subscriber, publisher);
-      let mqttReady = 0;
-      subscriber.on('connect', () => {
-        if (model.demoComparison !== run || !run.active) return;
-        subscriber.subscribe(mqttTopic, { qos: 0 }, error => {
-          if (error) { failDemoComparison(run, 'mqtt', error.message); return; }
-          mqttReady += 1; run.mqtt.status = mqttReady === 2 ? 'Connected' : 'Connecting'; renderDemoComparison();
-        });
-      });
-      publisher.on('connect', () => {
-        if (model.demoComparison !== run || !run.active) return;
-        mqttReady += 1; run.mqtt.status = mqttReady === 2 ? 'Connected' : 'Connecting'; renderDemoComparison();
-      });
-      subscriber.on('message', (_topic, bytes) => receiveDemoComparison(run, 'mqtt', new TextDecoder().decode(bytes)));
-      [subscriber, publisher].forEach(client => client.on('error', error => failDemoComparison(run, 'mqtt', error.message)));
-      [subscriber, publisher].forEach(client => client.on('close', () => {
-        if (run.active && model.demoComparison === run) { run.mqtt.status = 'Disconnected'; renderDemoComparison(); }
-      }));
-    } catch (error) { failDemoComparison(run, 'mqtt', error.message); }
-  }
-
-  function publishDemoComparison(payload) {
-    const run = model.demoComparison;
-    if (!run?.active || model.protocol !== 'demo') return;
-    const sequence = ++run.sequence;
-    const sentAt = Date.now();
-    const message = JSON.stringify({ ...payload, demo_mode: true, _vtaas_comparison: { run_id: run.runId, sequence, sent_at_ms: sentAt } });
-    const wsPublisher = run.websocket.clients[1];
-    if (run.websocket.status === 'Connected' && wsPublisher?.readyState === WebSocket.OPEN) {
-      try { wsPublisher.send(message); run.websocket.sent += 1; run.websocket.pending.set(sequence, sentAt); }
-      catch { run.websocket.errors += 1; }
-    }
-    const mqttPublisher = run.mqtt.clients[1];
-    if (run.mqtt.status === 'Connected' && mqttPublisher?.connected) {
-      mqttPublisher.publish(run.topic, message, { qos: 0, retain: false }, error => {
-        if (!run.active || model.demoComparison !== run) return;
-        if (error) { run.mqtt.errors += 1; run.mqtt.pending.delete(sequence); }
-        else { run.mqtt.sent += 1; run.mqtt.pending.set(sequence, sentAt); }
-        renderDemoComparison();
-      });
-    }
-    renderDemoComparison();
-  }
-
-  function receiveDemoComparison(run, protocol, raw) {
-    if (model.demoComparison !== run || !run.active) return;
-    try {
-      const message = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      const marker = message?._vtaas_comparison;
-      if (marker?.run_id !== run.runId || !Number.isFinite(Number(marker.sequence))) return;
-      const channel = run[protocol];
-      const sequence = Number(marker.sequence);
-      const sentAt = channel.pending.get(sequence) ?? Number(marker.sent_at_ms);
-      channel.pending.delete(sequence);
-      if (Number.isFinite(sentAt) && Date.now() >= sentAt) {
-        channel.received += 1;
-        channel.latencies.push(Date.now() - sentAt);
-        if (channel.latencies.length > 500) channel.latencies.shift();
+  // Preview all upcoming corners and brake early enough to reach their target speed.
+  function demoCruiseSpeed(distance) {
+    let remaining = ((distance % DEMO_ROUTE_LENGTH) + DEMO_ROUTE_LENGTH) % DEMO_ROUTE_LENGTH;
+    for (let i = 0; i < DEMO_ROUTE_SEGMENTS.length; i++) {
+      const segment = DEMO_ROUTE_SEGMENTS[i];
+      if (remaining <= segment.length) {
+        // One direction of the long straight occasionally tests overspeed;
+        // the return journey and shorter streets retain normal ~70 km/h cruise.
+        return segment.length > 350 && i < DEMO_ROUTE_SEGMENTS.length / 2 ? 90 : 70;
       }
-      renderDemoComparison();
-    } catch { run[protocol].errors += 1; renderDemoComparison(); }
-  }
-
-  function failDemoComparison(run, protocol, reason) {
-    if (model.demoComparison !== run || !run.active) return;
-    run[protocol].errors += 1;
-    run[protocol].status = `Error: ${reason}`;
-    $('#comparison-note').textContent = `Could not complete both paths. Check the endpoint and credentials. ${protocol.toUpperCase()} reported: ${reason}`;
-    renderDemoComparison();
-  }
-
-  function renderDemoComparison() {
-    const run = model.demoComparison;
-    if (!run) return;
-    for (const protocol of ['mqtt', 'websocket']) {
-      const channel = run[protocol];
-      const prefix = protocol === 'mqtt' ? 'mqtt' : 'ws';
-      const average = channel.latencies.length ? channel.latencies.reduce((sum, value) => sum + value, 0) / channel.latencies.length : null;
-      $(`#compare-${prefix}-count`).textContent = `${channel.sent} / ${channel.received}`;
-      $(`#compare-${prefix}-latency`).textContent = average === null ? '—' : `${Math.round(average)} ms`;
-      $(`#compare-${prefix}-result`).textContent = `${channel.status}${channel.errors ? ` · ${channel.errors} error(s)` : ''}`;
-      $(`#compare-${prefix}-delivery`).textContent = `Delivery ${channel.sent ? `${(channel.received / channel.sent * 100).toFixed(1)}%` : '—'}`;
+      remaining -= segment.length;
     }
+    return 70;
   }
 
-  function stopDemoComparison() {
-    const run = model.demoComparison;
-    if (!run) return;
-    run.active = false;
-    run.websocket.clients.forEach(client => { try { client.close(); } catch {} });
-    run.mqtt.clients.forEach(client => { try { client.end(true); } catch {} });
-    run.websocket.clients = [];
-    run.mqtt.clients = [];
-    if ($('#stop-demo-comparison')) $('#stop-demo-comparison').disabled = true;
-    if ($('#start-demo-comparison')) $('#start-demo-comparison').disabled = false;
-    $('#comparison-note').textContent = `Comparison stopped. Results above summarize this demo run (${run.websocket.sent} WebSocket sends; ${run.mqtt.sent} MQTT sends).`;
-    renderDemoComparison();
+  function demoRoadTargetSpeed(distance, cruiseKmh = 70) {
+    let end = 0, target = cruiseKmh;
+    const bearing = segment => Math.atan2((segment.to[0] - segment.from[0]) * Math.cos(segment.from[1] * Math.PI / 180), segment.to[1] - segment.from[1]) * 180 / Math.PI;
+    DEMO_ROUTE_SEGMENTS.forEach((segment, i) => {
+      end += segment.length;
+      const ahead = (end - distance + DEMO_ROUTE_LENGTH) % DEMO_ROUTE_LENGTH;
+      if (ahead > 180) return;
+      const next = DEMO_ROUTE_SEGMENTS[(i + 1) % DEMO_ROUTE_SEGMENTS.length];
+      const angle = Math.abs(angleDifferenceDegrees(bearing(next), bearing(segment)));
+      const cornerKmh = angle < 8 ? cruiseKmh : angle < 20 ? 55 : angle < 45 ? 40 : angle < 85 ? 28 : angle < 135 ? 18 : 10;
+      // 2.8 m/s² planned braking, with a 12 m corner approach buffer.
+      target = Math.min(target, Math.sqrt((cornerKmh / 3.6) ** 2 + 2 * 2.8 * Math.max(0, ahead - 12)) * 3.6);
+    });
+    return target;
   }
 
   function demoCrashReadings(elapsedSeconds) {
     const pulse = (time, center, width) => Math.exp(-(((time - center) / width) ** 2));
     const t = Math.max(0, elapsedSeconds);
+    const impactScale = (model.demoCrashDeceleration || 0) / 28;
     return {
       acceleration: {
         // A short forward deceleration pulse, a smaller lateral response, and a vertical shock.
-        x: -28 * Math.exp(-t / 0.18) + 7 * pulse(t, 0.42, 0.2),
-        y: 11 * pulse(t, 0.16, 0.22),
-        z: 9.81 + 18 * Math.exp(-t / 0.24),
+        x: -(model.demoCrashDeceleration || 0) * Math.exp(-t / 0.6),
+        y: (model.demoCrashDeceleration || 0) * 0.2 * pulse(t, 0.16, 0.22),
+        z: 9.81 + (model.demoCrashDeceleration || 0) * 0.4 * Math.exp(-t / 0.24),
         unit: 'm/s2'
       },
       gyroscope: {
         // Rotation follows the impact with a separate roll, pitch, and yaw response.
-        x: 220 * pulse(t, 0.3, 0.28) - 8 * Math.exp(-t / 0.4),
-        y: -210 * Math.exp(-t / 0.5) + 65 * pulse(t, 0.5, 0.24),
-        z: 82 * Math.exp(-t / 0.65) + 190 * pulse(t, 0.55, 0.3),
+        x: impactScale * (220 * pulse(t, 0.3, 0.28) - 8 * Math.exp(-t / 0.4)),
+        y: impactScale * (-210 * Math.exp(-t / 0.5) + 65 * pulse(t, 0.5, 0.24)),
+        z: impactScale * (82 * Math.exp(-t / 0.65) + 190 * pulse(t, 0.55, 0.3)),
         unit: 'deg/s'
       }
     };
   }
 
   function startDemo(resetCounts = false) {
+    if (!canStartProtocol()) return;
     const wasCloud = model.cloudMode;
     stopCloudListeners();
     model.cloudMode = false;
@@ -1130,6 +1252,8 @@
     model.intentionalDisconnect = false;
     model.protocol = 'demo';
     model.protocolSelection = 'demo';
+    beginProtocolSession();
+    lockProtocol('demo');
     model.demoPreviousSpeed = null;
     model.demoPreviousHeading = null;
     model.demoPreviousRoll = null;
@@ -1152,18 +1276,25 @@
     const isGpsLost = Date.now() < model.gpsUnavailableUntil;
     const isCancelled = Date.now() < model.demoCancelledUntil;
     const moving = !model.demoAccidentActive;
-    const speed = moving ? Math.max(0, 47 + Math.sin(t / 4) * 8 + Math.sin(t / 12) * 4) : 0;
-    const speedMps = speed / 3.6;
     const motionDt = model.demoLastMotionAt ? Math.max(0.1, Math.min(2, (now - model.demoLastMotionAt) / 1000)) : 0.85;
+    const previousMps = model.demoPreviousSpeed ?? 0;
+    const targetMps = demoRoadTargetSpeed(model.demoDistance, (Date.now() < (model.demoOverspeedUntil || 0) ? 90 : demoCruiseSpeed(model.demoDistance)) + 1.2 * Math.sin(t / 12)) / 3.6;
+    const speedMps = moving ? Math.max(0, previousMps + Math.max(-2.8 * motionDt, Math.min(1.6 * motionDt, targetMps - previousMps))) : 0;
+    const speed = speedMps * 3.6;
     const longitudinalAcceleration = model.demoPreviousSpeed === null ? 0 : (speedMps - model.demoPreviousSpeed) / motionDt;
+    if (moving) model.demoDistance = (model.demoDistance + (previousMps + speedMps) * 0.5 * motionDt) % DEMO_ROUTE_LENGTH;
     const heading = demoRoadHeading(model.demoDistance);
-    const yawRate = model.demoPreviousHeading === null ? 0 : Math.max(-45, Math.min(45, angleDifferenceDegrees(heading, model.demoPreviousHeading) / motionDt));
+    const yawRate = !moving || speedMps < 0.05 || model.demoPreviousHeading === null ? 0 : Math.max(-45, Math.min(45, angleDifferenceDegrees(heading, model.demoPreviousHeading) / motionDt));
     const lateralAcceleration = speedMps * yawRate * Math.PI / 180;
-    const roll = Math.atan2(lateralAcceleration, 9.81) * 180 / Math.PI;
-    const pitch = Math.atan2(-longitudinalAcceleration, 9.81) * 180 / Math.PI;
+    // Suspension lean is a small fraction of force-equivalent tilt.
+    const response = 1 - Math.exp(-motionDt / 0.45);
+    const rollTarget = Math.atan2(lateralAcceleration * 0.2, 9.81) * 180 / Math.PI;
+    const roll = (model.demoPreviousRoll ?? 0) + response * (rollTarget - (model.demoPreviousRoll ?? 0));
+    const pitchTarget = Math.atan2(-longitudinalAcceleration * 0.15, 9.81) * 180 / Math.PI;
+    const pitch = (model.demoPreviousPitch ?? 0) + response * (pitchTarget - (model.demoPreviousPitch ?? 0));
     const rollRate = model.demoPreviousRoll === null ? 0 : (roll - model.demoPreviousRoll) / motionDt;
     const pitchRate = model.demoPreviousPitch === null ? 0 : (pitch - model.demoPreviousPitch) / motionDt;
-    const roadVibration = (0.12 + speedMps * 0.012) * Math.sin(model.demoDistance / 2.5);
+    const roadVibration = (speedMps > 0.05 ? 0.12 + speedMps * 0.012 : 0) * Math.sin(model.demoDistance / 2.5);
     model.demoPreviousSpeed = speedMps;
     model.demoPreviousHeading = heading;
     model.demoPreviousRoll = roll;
@@ -1172,7 +1303,6 @@
     const [routeLon, routeLat] = demoRoadPosition(model.demoDistance);
     const lon = model.demoAccidentActive && model.demoCrashGps ? model.demoCrashGps.longitude : routeLon;
     const lat = model.demoAccidentActive && model.demoCrashGps ? model.demoCrashGps.latitude : routeLat;
-    if (moving) model.demoDistance = (model.demoDistance + speed / 3.6 * 0.85) % DEMO_ROUTE_LENGTH;
     const impactActive = Date.now() < model.demoImpactUntil;
     const crashReadings = impactActive ? demoCrashReadings((Date.now() - model.demoCountdownStarted) / 1000) : null;
     const accel = crashReadings?.acceleration || {
@@ -1198,7 +1328,7 @@
       model.demoCountdownInterval = null;
     }
     const message = {
-      device_id: 'vehicle_01', event_id: model.currentEventId || undefined,
+      device_id: 'DEMO-01', device_name: 'Demo vehicle', event_id: model.currentEventId || undefined,
       message_type: state === 'COUNTDOWN' ? 'accident_countdown' : state === 'CONFIRMED' ? 'accident_confirmed' : 'telemetry',
       timestamp: new Date().toISOString(), vehicle_status: 'NORMAL', accident_state: state,
       severity: state === 'NONE' ? 'NONE' : model.demoAccidentSeverity,
@@ -1223,14 +1353,16 @@
     model.demoCrashGps = gps?.valid ? { latitude: gps.latitude, longitude: gps.longitude } : null;
     model.demoImpactUntil = model.demoCountdownStarted + 2500;
     const crashSpeed = finite(model.telemetry?.speed_kmh) ?? 48.5;
-    const crashDeceleration = 28;
+    // Synthetic equivalent deceleration: speed change over a 0.6 s stop.
+    const crashDeceleration = crashSpeed / 3.6 / 0.6;
+    model.demoCrashDeceleration = crashDeceleration;
     model.demoAccidentSeverity = estimateAccidentSeverity(crashSpeed, crashDeceleration);
     model.currentEventId = `evt_${Date.now().toString(36)}`;
     const crashReadings = demoCrashReadings(0);
     const payload = {
-      device_id: 'vehicle_01', event_id: model.currentEventId, message_type: 'accident_detected',
+      device_id: 'DEMO-01', device_name: 'Demo vehicle', event_id: model.currentEventId, message_type: 'accident_detected',
       timestamp: new Date().toISOString(), accident_state: 'COUNTDOWN', severity: model.demoAccidentSeverity, countdown_remaining_s: 15,
-      speed_kmh: 0, crash_speed_kmh: crashSpeed, deceleration_mps2: crashDeceleration, speed_limit_kmh: SPEED_LIMIT_DEFAULT,
+      speed_kmh: 0, crash_speed_kmh: crashSpeed, deceleration_mps2: crashDeceleration, deceleration_source: 'Simulation: speed / 0.6 s stop', speed_limit_kmh: SPEED_LIMIT_DEFAULT,
       acceleration: crashReadings.acceleration,
       gyroscope: crashReadings.gyroscope,
       gps: gps ? { ...gps, speed_kmh: 0 } : undefined
@@ -1265,7 +1397,7 @@
     model.demoCancelledUntil = Date.now() + 5000;
     model.demoCountdown = 0;
     model.demoConfirmed = false;
-    parseAndHandle({ device_id: 'vehicle_01', event_id: model.currentEventId, message_type: 'accident_cancelled', timestamp: new Date().toISOString(), accident_state: 'CANCELLED', reason: 'DRIVER_CANCEL', severity: 'MODERATE', gps: model.telemetry?.gps }, 'demo');
+    parseAndHandle({ device_id: 'DEMO-01', device_name: 'Demo vehicle', event_id: model.currentEventId, message_type: 'accident_cancelled', timestamp: new Date().toISOString(), accident_state: 'CANCELLED', reason: 'DRIVER_CANCEL', severity: 'MODERATE', gps: model.telemetry?.gps }, 'demo');
     showToast('Demo event marked cancelled.');
   }
 
@@ -1275,18 +1407,36 @@
       case 'suspected': startSuspectedScenario(); break;
       case 'sos': {
         model.currentEventId = `sos_${Date.now().toString(36)}`;
-        parseAndHandle({ device_id: 'vehicle_01', event_id: model.currentEventId, message_type: 'manual_sos', timestamp: new Date().toISOString(), accident_state: 'SOS', severity: 'EMERGENCY', gps: model.telemetry?.gps, speed_kmh: model.telemetry?.speed_kmh }, 'demo');
+        parseAndHandle({ device_id: 'DEMO-01', device_name: 'Demo vehicle', event_id: model.currentEventId, message_type: 'manual_sos', timestamp: new Date().toISOString(), accident_state: 'SOS', severity: 'EMERGENCY', gps: model.telemetry?.gps, speed_kmh: model.telemetry?.speed_kmh }, 'demo');
         showToast('Demo manual SOS event added to history.'); displayPage('overview'); break;
       }
       case 'overspeed': {
-        parseAndHandle({ device_id: 'vehicle_01', event_id: `speed_${Date.now().toString(36)}`, message_type: 'overspeed_alert', timestamp: new Date().toISOString(), vehicle_status: 'OVERSPEED', speed_kmh: 96.4, speed_limit_kmh: 80, severity: 'WARNING', gps: model.telemetry?.gps }, 'demo');
-        showToast('Demo overspeed event added to history.'); displayPage('overview'); break;
+        model.demoOverspeedUntil = Date.now() + 120000;
+        showToast('Overspeed test armed: accelerating where the road permits. An alert is recorded when actual simulated speed exceeds 80 km/h.'); displayPage('overview'); break;
       }
       case 'gps-loss': model.gpsUnavailableUntil = Date.now() + 12000; showToast('GPS fix will be unavailable for 12 seconds in demo mode.'); break;
     }
   }
 
-  function cleanupTransport() {
+  function freezeMeasurements() {
+    for (const metric of ['latency', 'delivery']) {
+      if ($(`#bench-${metric}`).textContent === '—') continue;
+      const note = $(`#bench-${metric}-note`);
+      if (!note.textContent.startsWith('Last result · disconnected. ')) {
+        note.textContent = `Last result · disconnected. ${note.textContent}`;
+      }
+    }
+  }
+
+  function cleanupTransport({ preserveMeasurements = false, releaseLock = true } = {}) {
+    stopBleProbes();
+    stopNetworkProbes();
+    clearTimeout(model.connectionTimer); model.connectionTimer = null;
+    model.transportGeneration += 1;
+    if (releaseLock) model.protocolLock = null;
+    updateProtocolLock();
+    if (preserveMeasurements) freezeMeasurements();
+    else resetMeasurements();
     if (model.calibrationCapture) stopCalibration('Capture stopped because the device connection changed. Reconnect and try again.');
     // Do not let samples from a prior transport (especially the simulator) leak into
     // a new device's crash evidence or sensor charts.
@@ -1298,6 +1448,7 @@
     if (model.ws) { const socket = model.ws; model.ws = null; socket.onclose = null; socket.onerror = null; try { socket.close(); } catch {} }
     if (model.mqtt) { const client = model.mqtt; model.mqtt = null; try { client.end(true); } catch {} }
     if (model.bleCharacteristic) { try { model.bleCharacteristic.removeEventListener('characteristicvaluechanged', onBleValue); } catch {} }
+    if (model.bleDevice) { try { model.bleDevice.removeEventListener('gattserverdisconnected', onBleDisconnect); } catch {} }
     if (model.bleDevice?.gatt?.connected) { try { model.bleDevice.gatt.disconnect(); } catch {} }
     model.bleDevice = null; model.bleServer = null; model.bleCharacteristic = null; model.bleBuffer = '';
   }
@@ -1309,102 +1460,232 @@
   }
 
   function connectWebSocket() {
+    if (!canStartProtocol()) return;
     const url = $('#ws-url').value.trim();
     if (!/^wss?:\/\//i.test(url)) { showToast('Enter a WebSocket URL beginning with ws:// or wss://.'); return; }
     if ($('#ws-secure').checked && !url.startsWith('wss://')) { showToast('Secure WebSocket is required; use a wss:// URL.'); return; }
-    cleanupTransport(); stopDemo();
+    cleanupTransport(); stopCloudListeners(); stopDemo(); model.cloudMode = false;
     model.protocol = 'websocket'; model.intentionalDisconnect = false; model.protocolSelection = 'websocket';
+    beginProtocolSession();
+    lockProtocol('websocket');
     setProtocolTab('websocket'); $('#selected-protocol-value').textContent = 'WebSocket';
     $('#disconnect-button').textContent = 'Disconnect';
-    toggleProtocolConnectionState(false, 'Connecting to the WebSocket endpoint…');
+    toggleProtocolConnectionState('connecting', 'Connecting to the WebSocket endpoint…');
     openWebSocket(url);
   }
 
-  function openWebSocket(url) {
+  async function openWebSocket(url) {
+    const generation = model.transportGeneration;
+    if (model.intentionalDisconnect || model.protocol !== 'websocket') return;
+    startConnectionDeadline('WebSocket connection timed out. Check the server and try again.');
+    let firebaseIdToken = null;
+    let hostedRelay = false;
+    try { hostedRelay = new URL(url).hostname.endsWith('.workers.dev'); } catch {}
+    if (hostedRelay) {
+      if (!model.firebaseClient?.getIdToken) {
+        failConnection('Sign in to VT&AAS before connecting to the hosted WebSocket relay.');
+        showToast('Sign in to VT&AAS before using the hosted WebSocket relay.');
+        return;
+      }
+      try { firebaseIdToken = await model.firebaseClient.getIdToken(); }
+      catch { firebaseIdToken = null; }
+      if (generation !== model.transportGeneration || model.intentionalDisconnect) return;
+      if (!firebaseIdToken) {
+        failConnection('Your VT&AAS sign-in expired. Sign in again and retry.');
+        showToast('Your VT&AAS sign-in expired. Sign in again and retry.');
+        return;
+      }
+    }
+    if (generation !== model.transportGeneration || model.intentionalDisconnect) return;
     let socket;
     try { socket = new WebSocket(url); }
-    catch (error) { model.errorCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, error.message); showToast(`Could not connect: ${error.message}`); return; }
+    catch (error) { model.errorCount += 1; updateConnectionCounters(); failConnection(error.message); showToast(`Could not connect: ${error.message}`); return; }
     model.ws = socket;
-    socket.onopen = () => { if (model.ws !== socket) return; model.reconnectAttempt = 0; toggleProtocolConnectionState(true, `Connected to ${url}`); syncBufferedEvents(url); showToast('WebSocket connected. Waiting for telemetry.'); };
-    socket.onmessage = event => { if (model.ws !== socket) return; parseAndHandle(event.data, 'websocket'); };
-    socket.onerror = () => { if (model.ws !== socket) return; model.errorCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, 'WebSocket connection error. Check the URL and server.'); };
-    socket.onclose = () => { if (model.ws !== socket) return; model.ws = null; toggleProtocolConnectionState(false, 'WebSocket disconnected.'); if (!model.intentionalDisconnect && $('#ws-reconnect').checked) scheduleReconnect(() => openWebSocket(url)); };
+    let authenticated = !hostedRelay;
+    socket.onopen = () => {
+      if (model.ws !== socket || model.intentionalDisconnect) return;
+      model.reconnectAttempt = 0;
+      if (hostedRelay) {
+        toggleProtocolConnectionState('connecting', 'Secure connection open · verifying VT&AAS sign-in…');
+        socket.send(JSON.stringify({ type: 'auth', role: 'dashboard', token: firebaseIdToken, vehicle_id: model.deviceId || 'vehicle_01' }));
+        return;
+      }
+      toggleProtocolConnectionState(true, `Connected to ${url}`);
+      syncBufferedEvents(url);
+      showToast('WebSocket connected. Waiting for telemetry.');
+    };
+    socket.onmessage = event => {
+      if (model.ws !== socket || model.intentionalDisconnect) return;
+      let control;
+      try { control = JSON.parse(event.data); } catch {}
+      if (control?.type === 'ready') return;
+      if (acceptNetworkPong(control)) return;
+      if (control?.type === 'auth_ok') {
+        authenticated = true;
+        toggleProtocolConnectionState(true, `Connected to secure VT&AAS WebSocket relay · ${url}`);
+        if (control.benchmark === 'device_ping_v1') startNetworkProbes(packet => { if (model.ws !== socket || socket.readyState !== 1) throw new Error('Disconnected'); socket.send(JSON.stringify(packet)); });
+        else $('#bench-latency-note').textContent = 'Device ping requires updated relay support';
+        showToast('Secure WebSocket connected. Waiting for ESP32 telemetry.');
+        return;
+      }
+      if (control?.type === 'error') {
+        model.errorCount += 1;
+        updateConnectionCounters();
+        failConnection(`WebSocket authorization failed: ${control.error || 'request rejected'}`);
+        showToast(`WebSocket authorization failed: ${control.error || 'request rejected'}`);
+        socket.close(1008, 'Authorization failed.');
+        return;
+      }
+      if (!authenticated) return;
+      parseAndHandle(event.data, 'websocket');
+    };
+    socket.onerror = () => { if (model.ws !== socket || model.intentionalDisconnect) return; stopNetworkProbes(); model.errorCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, 'WebSocket connection error. Check the URL and server.'); };
+    socket.onclose = () => { if (model.ws !== socket || model.intentionalDisconnect) return; model.ws = null; stopNetworkProbes(); toggleProtocolConnectionState(false, 'WebSocket disconnected.'); if (!model.intentionalDisconnect && $('#ws-reconnect').checked) scheduleReconnect(() => openWebSocket(url)); };
   }
 
   function scheduleReconnect(callback) {
     clearTimeout(model.reconnectTimer);
     const wait = Math.min(30000, 1000 * (2 ** Math.min(model.reconnectAttempt, 5)));
     model.reconnectAttempt += 1; model.reconnectCount += 1; updateConnectionCounters();
-    toggleProtocolConnectionState(false, `Reconnecting in ${Math.ceil(wait / 1000)}s…`);
+    toggleProtocolConnectionState('connecting', `Reconnecting in ${Math.ceil(wait / 1000)}s…`);
     model.reconnectTimer = setTimeout(callback, wait);
   }
 
   function connectMqtt() {
+    if (!canStartProtocol()) return;
     const url = $('#mqtt-url').value.trim();
     const topic = $('#mqtt-topic').value.trim();
     if (!/^wss?:\/\//i.test(url)) { showToast('Enter a broker WebSocket URL beginning with ws:// or wss://.'); return; }
     if (!topic) { showToast('Enter an MQTT topic or topic filter.'); return; }
     if (!window.mqtt || typeof window.mqtt.connect !== 'function') { showToast('MQTT.js could not load. Check internet access and reload the dashboard.'); return; }
-    cleanupTransport(); stopDemo();
+    cleanupTransport(); stopCloudListeners(); stopDemo(); model.cloudMode = false;
     model.protocol = 'mqtt'; model.protocolSelection = 'mqtt'; model.intentionalDisconnect = false; model.reconnectAttempt = 0;
+    beginProtocolSession();
+    lockProtocol('mqtt');
     setProtocolTab('mqtt'); $('#selected-protocol-value').textContent = 'MQTT'; $('#disconnect-button').textContent = 'Disconnect';
-    toggleProtocolConnectionState(false, 'Connecting to the MQTT broker…');
+    toggleProtocolConnectionState('connecting', 'Connecting to the MQTT broker…');
+    startConnectionDeadline('MQTT connection timed out. Check the broker and credentials, then try again.');
     const options = { clientId: $('#mqtt-client').value.trim() || `vtaas_${Math.random().toString(16).slice(2, 10)}`, clean: true, connectTimeout: 10000, reconnectPeriod: $('#mqtt-reconnect').checked ? 2000 : 0 };
     if ($('#mqtt-user').value) options.username = $('#mqtt-user').value;
     if ($('#mqtt-password').value) options.password = $('#mqtt-password').value;
     try {
       const client = window.mqtt.connect(url, options);
       model.mqtt = client;
-      client.on('connect', () => { if (model.mqtt !== client) return; model.reconnectAttempt = 0; toggleProtocolConnectionState(true, `Broker connected · subscribing to ${topic}`); client.subscribe(topic, { qos: 0 }, error => { if (error) { model.errorCount += 1; updateConnectionCounters(); showToast(`Subscription failed: ${error.message}`); } else showToast('MQTT connected and subscribed.'); }); });
-      client.on('message', (receivedTopic, bytes) => { if (model.mqtt !== client) return; const text = new TextDecoder().decode(bytes); try { const parsed = JSON.parse(text); parsed._topic = receivedTopic; parseAndHandle(parsed, 'mqtt', receivedTopic); } catch (error) { model.errorCount += 1; updateConnectionCounters(); showToast(`Message rejected: ${error.message}`); } });
-      client.on('reconnect', () => { if (model.mqtt !== client) return; model.reconnectCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, 'Reconnecting to the MQTT broker…'); });
-      client.on('offline', () => { if (model.mqtt === client) toggleProtocolConnectionState(false, 'MQTT broker offline.'); });
-      client.on('error', error => { if (model.mqtt !== client) return; model.errorCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, `MQTT error: ${error.message}`); });
-    } catch (error) { model.errorCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, error.message); showToast(`Could not start MQTT: ${error.message}`); }
+      client.on('connect', () => { if (model.mqtt !== client || model.intentionalDisconnect) return; model.reconnectAttempt = 0; toggleProtocolConnectionState('connecting', `Broker connected · subscribing to ${topic}`); client.subscribe(topic, { qos: 0 }, (error, granted) => { if (model.mqtt !== client || model.intentionalDisconnect) return; if (error || granted?.some(item => item.qos === 128)) { model.errorCount += 1; updateConnectionCounters(); failConnection('MQTT subscription failed. Check the topic permissions and try again.'); showToast(`Subscription failed: ${error?.message || 'topic rejected'}`); } else { toggleProtocolConnectionState(true, `Connected to MQTT broker · subscribed to ${topic}`); showToast('MQTT connected and subscribed.'); startMqttProbes(client, topic); } }); });
+      client.on('message', (receivedTopic, bytes) => { if (model.mqtt !== client || model.intentionalDisconnect) return; const text = new TextDecoder().decode(bytes); try { const parsed = JSON.parse(text); if (receivedTopic === model.mqttProbeReplyTopic) { acceptNetworkPong(parsed); return; } if (parsed?.message_type === 'benchmark_ping' || parsed?.message_type === 'benchmark_pong') return; parsed._topic = receivedTopic; parseAndHandle(parsed, 'mqtt', receivedTopic); } catch (error) { model.errorCount += 1; updateConnectionCounters(); showToast(`Message rejected: ${error.message}`); } });
+      client.on('reconnect', () => { if (model.mqtt !== client || model.intentionalDisconnect) return; stopNetworkProbes(); model.reconnectCount += 1; updateConnectionCounters(); toggleProtocolConnectionState('connecting', 'Reconnecting to the MQTT broker…'); startConnectionDeadline('MQTT reconnection timed out. Check the broker and try again.'); });
+      client.on('close', () => { if (model.mqtt === client && !model.intentionalDisconnect) { stopNetworkProbes(); toggleProtocolConnectionState(false, 'MQTT connection closed.'); } });
+      client.on('offline', () => { if (model.mqtt === client && !model.intentionalDisconnect) { stopNetworkProbes(); toggleProtocolConnectionState(false, 'MQTT broker offline.'); } });
+      client.on('error', error => { if (model.mqtt !== client || model.intentionalDisconnect) return; model.errorCount += 1; updateConnectionCounters(); failConnection(`MQTT error: ${error.message}`); });
+    } catch (error) { model.errorCount += 1; updateConnectionCounters(); failConnection(error.message); showToast(`Could not start MQTT: ${error.message}`); }
   }
 
   async function connectBluetooth() {
+    if (!canStartProtocol()) return;
     if (!navigator.bluetooth) { showToast('Web Bluetooth is unavailable in this browser. Try Chrome on Android or desktop over HTTPS/localhost.'); return; }
     const serviceId = $('#ble-service').value.trim(); const characteristicId = $('#ble-characteristic').value.trim();
     if (!serviceId || !characteristicId) { showToast('Enter the BLE service and notify characteristic UUIDs from your firmware.'); return; }
-    cleanupTransport(); stopDemo(); model.protocol = 'bluetooth'; model.protocolSelection = 'bluetooth'; model.intentionalDisconnect = false;
+    cleanupTransport(); stopCloudListeners(); stopDemo(); model.cloudMode = false; model.protocol = 'bluetooth'; model.protocolSelection = 'bluetooth'; model.intentionalDisconnect = false;
+    beginProtocolSession();
+    lockProtocol('bluetooth');
     setProtocolTab('bluetooth'); $('#selected-protocol-value').textContent = 'Bluetooth LE'; $('#disconnect-button').textContent = 'Disconnect';
-    toggleProtocolConnectionState(false, 'Choose the ESP32 BLE device…');
+    toggleProtocolConnectionState('connecting', 'Choose the ESP32 BLE device…');
+    const generation = model.transportGeneration;
+    const current = () => generation === model.transportGeneration && !model.intentionalDisconnect;
     try {
       const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [serviceId] }], optionalServices: [serviceId] });
+      if (!current()) return;
+      startConnectionDeadline('Bluetooth connection timed out. Disconnect the ESP32 from other apps and try again.');
       model.bleDevice = device;
       device.addEventListener('gattserverdisconnected', onBleDisconnect);
-      const server = await device.gatt.connect(); model.bleServer = server;
+      const server = await device.gatt.connect();
+      if (!current()) { device.gatt.disconnect(); return; }
+      model.bleServer = server;
       const service = await server.getPrimaryService(serviceId);
       const characteristic = await service.getCharacteristic(characteristicId);
+      if (!current()) return;
       model.bleCharacteristic = characteristic;
-      await characteristic.startNotifications(); characteristic.addEventListener('characteristicvaluechanged', onBleValue);
+      characteristic.addEventListener('characteristicvaluechanged', onBleValue);
+      await characteristic.startNotifications();
+      if (!current()) return;
       toggleProtocolConnectionState(true, `Connected to ${device.name || 'ESP32 BLE device'} · listening for JSON`);
       showToast('BLE connected. Send newline-delimited JSON from the ESP32.');
+      $('#bench-latency-label').textContent = 'LATENCY (ROUND TRIP)';
+      $('#bench-latency-note').textContent = 'Checking ESP32 ping support…';
+      try {
+        const probe = await service.getCharacteristic('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
+        if (!current()) return;
+        model.bleProbe = probe;
+        if (!model.bleProbe.properties.write) throw new Error('Ping writes unavailable');
+        $('#bench-latency-note').textContent = 'Waiting for ping reply · sampled every 5 seconds';
+        await sendBleProbe();
+        if (!current()) return;
+        model.bleProbeTimer = setInterval(sendBleProbe, 5000);
+      } catch {
+        if (!current()) return;
+        stopBleProbes();
+        $('#bench-latency-note').textContent = 'Upload the updated BLE sketch to enable ping replies';
+      }
     } catch (error) {
-      model.errorCount += 1; updateConnectionCounters(); toggleProtocolConnectionState(false, error.message || 'BLE connection failed.'); showToast(`BLE connection failed: ${error.message || 'Unknown error'}`);
+      if (!current()) return;
+      if (error.name !== 'NotFoundError') { model.errorCount += 1; updateConnectionCounters(); }
+      failConnection(error.name === 'NotFoundError' ? 'Bluetooth selection cancelled. Choose a protocol to try again.' : `Bluetooth connection failed: ${error.message || 'Unknown error'}`);
     }
   }
 
   function onBleValue(event) {
+    if (model.intentionalDisconnect) return;
     const value = event.target.value;
     const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     model.bleBuffer += new TextDecoder().decode(bytes, { stream: true });
     if (model.bleBuffer.length > BLE_BUFFER_LIMIT) { model.bleBuffer = ''; model.errorCount += 1; updateConnectionCounters(); showToast('BLE message buffer was reset because no line ending arrived.'); return; }
     const lines = model.bleBuffer.split(/\r?\n/); model.bleBuffer = lines.pop() || '';
-    lines.map(line => line.trim()).filter(Boolean).forEach(line => parseAndHandle(line, 'bluetooth'));
+    lines.map(line => line.trim()).filter(Boolean).forEach(line => {
+      try { if (acceptBlePong(JSON.parse(line))) return; } catch {}
+      parseAndHandle(line, 'bluetooth');
+    });
   }
 
-  function onBleDisconnect() {
+  function onBleDisconnect(event) {
+    if (event?.target && event.target !== model.bleDevice) return;
     if (model.protocol !== 'bluetooth' || model.intentionalDisconnect) return;
+    stopBleProbes();
+    freezeMeasurements();
     model.bleServer = null; toggleProtocolConnectionState(false, 'BLE device disconnected.');
     if ($('#ws-reconnect').checked) { model.reconnectCount += 1; updateConnectionCounters(); showToast('BLE disconnected. Reconnect from the protocol panel.'); }
   }
 
-  function disconnect() {
+  function waitForTransportClose() {
+    const waits = [];
+    if (model.ws && model.ws.readyState !== WebSocket.CLOSED) {
+      const socket = model.ws;
+      waits.push(new Promise(resolve => socket.addEventListener('close', resolve, { once: true })));
+    }
+    if (model.mqtt && !model.mqtt.disconnected) {
+      const client = model.mqtt;
+      waits.push(new Promise(resolve => client.once('end', resolve)));
+    }
+    if (model.bleDevice?.gatt?.connected) {
+      waits.push(new Promise(resolve => model.bleDevice.addEventListener('gattserverdisconnected', resolve, { once: true })));
+    }
+    return Promise.all(waits);
+  }
+
+  async function disconnect() {
+    if (model.connectionState === 'disconnecting') return;
     model.intentionalDisconnect = true;
-    if (model.protocol === 'demo') { stopDemo(); toggleProtocolConnectionState(false, 'Demo stream stopped.'); $('#disconnect-button').textContent = 'Start demo'; return; }
-    cleanupTransport(); toggleProtocolConnectionState(false, 'Transport disconnected.'); showToast('Disconnected.');
+    toggleProtocolConnectionState('disconnecting', `Disconnecting ${protocolName()}…`);
+    stopBleProbes();
+    // Stop immediately, including when the tab is in the background.
+    const closed = waitForTransportClose();
+    stopDemo(); stopCloudListeners(); model.cloudMode = false;
+    cleanupTransport({ preserveMeasurements: true, releaseLock: false });
+    let closeTimer;
+    await Promise.race([closed, new Promise(resolve => { closeTimer = setTimeout(resolve, 5000); })]);
+    clearTimeout(closeTimer);
+    model.protocolLock = null; updateProtocolLock();
+    toggleProtocolConnectionState('disconnected', `${protocolName()} disconnected. Last measurements are retained.`);
+    showToast('Disconnected.');
   }
 
   async function loadAccount() {
@@ -1441,12 +1722,15 @@
   }
 
   function startCloudMode(firebase) {
+    if (!canStartProtocol()) return;
     stopCloudListeners();
     stopDemo();
     cleanupTransport();
     model.firebaseClient = firebase;
     model.cloudMode = true;
     model.protocol = 'firebase';
+    beginProtocolSession();
+    setProtocolTab('firebase');
     model.intentionalDisconnect = false;
     clearTelemetryForLiveWait();
     $('#selected-protocol-value').textContent = 'Firebase cloud';
@@ -1468,15 +1752,13 @@
     model.cloudUnsubscribers.push(firebase.watchLatest(vehicleId, payload => {
       if (!model.cloudMode) return;
       if (!payload || typeof payload !== 'object') {
-        $('#connection-status').textContent = 'Cloud connected · waiting for ESP32 data';
-        $('#protocol-status-copy').textContent = 'Cloud connected · waiting for ESP32 data';
+        toggleProtocolConnectionState(true, 'Firebase cloud connected · waiting for ESP32 data.');
         return;
       }
       try {
         handleMessage(payload, 'firebase');
         $('#protocol-last-message').textContent = localTime(new Date());
-        $('#protocol-status-copy').textContent = 'Live telemetry received from Firebase Realtime Database.';
-        $('#connection-status').textContent = 'Receiving live data from Firebase';
+        toggleProtocolConnectionState(true, 'Receiving live data from Firebase.');
       } catch (error) {
         model.errorCount += 1; updateConnectionCounters();
         $('#protocol-status-copy').textContent = `Cloud data format error: ${error.message}`;
@@ -1514,27 +1796,32 @@
   }
 
   function init() {
+    if ('ResizeObserver' in window) {
+      model.mapResizeObserver = new ResizeObserver(() => invalidateMapSize());
+      model.mapResizeObserver.observe($('#map-frame'));
+    }
+    window.addEventListener('resize', invalidateMapSize, { passive: true });
     $('#today-label').textContent = new Date().toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
-    loadAccount();
+    $('#retry-map').addEventListener('click', retryMapTiles);
     $('#logout-button').addEventListener('click', signOut);
     $('#mqtt-client').value = `vtaas_${Math.random().toString(16).slice(2, 8)}`;
     $$('.nav-item').forEach(button => button.addEventListener('click', () => displayPage(button.dataset.page)));
     $$('[data-goto]').forEach(button => button.addEventListener('click', () => displayPage(button.dataset.goto)));
     $('#protocol-shortcut').addEventListener('click', () => {
+      if (model.protocolLock !== null) { displayPage('protocols'); setProtocolTab(model.protocolLock); return; }
       if (model.protocol === 'demo' && model.firebaseClient) {
         startCloudMode(model.firebaseClient);
         displayPage('overview');
         showToast('Back to live Firebase mode. Waiting for ESP32 data.');
         return;
       }
-      displayPage('protocols'); setProtocolTab(model.protocol || 'demo');
+      displayPage('protocols'); setProtocolTab(model.protocolSelection || 'websocket');
     });
-    $$('.protocol-tab').forEach(button => button.addEventListener('click', () => { if (button.dataset.protocol === 'demo' && model.protocol !== 'demo') startDemo(); else setProtocolTab(button.dataset.protocol); }));
+    $$('.protocol-tab').forEach(button => button.addEventListener('click', () => { if (model.protocolLock !== null && button.dataset.protocol !== model.protocolLock) return; if (button.dataset.protocol === 'demo' && model.protocol !== 'demo') startDemo(); else setProtocolTab(button.dataset.protocol); }));
     $$('.connect-button').forEach(button => button.addEventListener('click', () => ({ websocket: connectWebSocket, mqtt: connectMqtt, bluetooth: connectBluetooth })[button.dataset.connect]()));
     $('#disconnect-button').addEventListener('click', () => { if (model.protocol === 'demo' && !model.demoInterval) startDemo(); else disconnect(); });
-    $('#start-demo-comparison').addEventListener('click', startDemoComparison);
-    $('#stop-demo-comparison').addEventListener('click', stopDemoComparison);
     $('#simulate-event').addEventListener('click', () => {
+      if (model.protocolLock !== null && model.protocolLock !== 'demo') { canStartProtocol(); return; }
       if (model.protocol !== 'demo' || !model.demoInterval) {
         startDemo();
         displayPage('overview');
@@ -1557,13 +1844,12 @@
     $('#close-evidence').addEventListener('click', () => $('#evidence-modal').close());
     $('#export-events').addEventListener('click', exportCsv);
     $('#clear-events').addEventListener('click', () => { if (!model.events.length || confirm('Clear event history saved in this browser? The relay’s backup remains on the computer but won’t be restored unless it is updated again.')) { model.events = []; model.currentEventId = null; model.eventIds.clear(); localStorage.setItem(HISTORY_CLEAR_KEY, String(Date.now())); saveEvents(); renderRecentEvents(); renderHistory(); showToast('Browser event history cleared.'); } });
-    window.addEventListener('pagehide', stopDemoComparison);
     renderRecentEvents(); renderHistory(); renderCalibrationPanel(); updateUnitCard(); void loadAccount();
     setInterval(() => {
       if (model.telemetry) {
         const age = Date.now() - model.lastMessageAt;
-        $('#sensor-freshness').textContent = age < 4000 ? 'Fresh' : age < 15000 ? 'Data aging' : 'Stale data';
-        $('#sensor-freshness').style.color = age < 4000 ? 'var(--green)' : age < 15000 ? 'var(--amber)' : 'var(--red)';
+        $('#sensor-freshness').textContent = !model.connected ? `Last reading · ${model.connectionState}` : age < 4000 ? 'Fresh' : age < 15000 ? 'Data aging' : 'Stale data';
+        $('#sensor-freshness').style.color = !model.connected ? (model.connectionState === 'disconnected' ? 'var(--red)' : 'var(--amber)') : age < 4000 ? 'var(--green)' : age < 15000 ? 'var(--amber)' : 'var(--red)';
         updateDeviceHealth(); updateUnitCard(); renderCalibrationPanel();
         if (model.lastGpsAt && Date.now() - model.lastGpsAt > 15000 && model.telemetry.gps.valid) { model.telemetry.gps.valid = false; renderDashboard(); }
       }

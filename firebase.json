@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "vt-aas",
     "public": ".",
     "ignore": [
       "firebase.json",
@@ -18,10 +19,15 @@
       ".arduino/**",
       ".vscode/**",
       ".firebase/**",
+      ".firebase-user-config/**",
+      ".wrangler/**",
+      ".wrangler-user-config/**",
+      ".device-ws-token",
       ".git/**",
       ".firebaserc",
       ".gitignore",
       "firmware/**",
+      "cloudflare/**",
       "cloud-relay.js",
       "render.yaml",
       ".env",
